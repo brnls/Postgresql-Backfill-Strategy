@@ -6,7 +6,7 @@ This repo sets up a local PostgreSQL 16 benchmark for the migration pattern you 
 - a new nullable `timestamptz` column added after the table is already large
 - new inserts and updates populate the new column immediately
 - old rows are backfilled in batches by extracting a value from a large `jsonb` payload
-- the comparison is `UUID PK ordered` batches vs `CTID ordered` batches
+- the comparison is `UUID PK ordered`, `CTID ordered`, and `chunked CTID ordered` batches
 
 The benchmark is intentionally built around throughput of the backfill job while concurrent inserts and updates continue to run.
 
@@ -25,6 +25,7 @@ The benchmark is intentionally built around throughput of the backfill job while
   - running the CTID-ordered backfill
   - running the chunked CTID-ordered backfill
 - `pgbench` scripts for concurrent inserts and updates
+- [`scripts.ps1`](/C:/Code/20260329%20PostgresqlLoadTesting/scripts.ps1) as the primary way to run the benchmark
 
 ## Important Scaling Note
 
@@ -37,70 +38,35 @@ Because of that, the fixture is parameterized:
 
 The default blob target is `2500` bytes, which is usually enough to push the payload into TOAST territory without immediately making the local benchmark enormous. If you want to chase the production shape more closely, increase it gradually and watch disk growth.
 
-## Start Postgres
+## Quick Start
 
-```powershell
-docker compose up -d
-docker compose ps
-```
-
-Or with the helper script:
+Start Postgres:
 
 ```powershell
 .\scripts.ps1 Up
 ```
 
-## Seed A Fixture
-
-This creates the base table state. The seeded rows all start with `extracted_at = NULL`.
-
-For a quick smoke test:
+Seed a quick smoke-test fixture:
 
 ```powershell
-docker compose exec -T postgres psql -U postgres -d bench -v ON_ERROR_STOP=1 -c "CALL bench.seed_fixture(200000, 2.5, 64, 2500);"
+.\scripts.ps1 Seed -RowCount 200000 -HotPct 2.5 -TemplateCount 64 -BlobTargetBytes 2500
 ```
 
-For the bigger scenario:
-
-```powershell
-docker compose exec -T postgres psql -U postgres -d bench -v ON_ERROR_STOP=1 -c "CALL bench.seed_fixture(10000000, 2.5, 128, 2500);"
-```
-
-Helper script:
+Seed a bigger fixture:
 
 ```powershell
 .\scripts.ps1 Seed -RowCount 10000000 -HotPct 2.5 -TemplateCount 128 -BlobTargetBytes 2500
 ```
 
-Parameter order:
-
-1. `p_row_count`
-2. `p_hot_pct`
-3. `p_template_count`
-4. `p_blob_target_bytes`
-5. optional `p_history_span`
-
 ## Inspect The Fixture
 
-Check the table shape:
-
-```powershell
-docker compose exec -T postgres psql -U postgres -d bench -c "SELECT source, is_hot, count(*) FROM bench.orders GROUP BY 1, 2 ORDER BY 1, 2;"
-```
-
-Helper script:
+Show counts by source and hot flag:
 
 ```powershell
 .\scripts.ps1 Shape
 ```
 
-Check the approximate raw payload text size:
-
-```powershell
-docker compose exec -T postgres psql -U postgres -d bench -c "SELECT avg(octet_length(payload::text))::bigint AS avg_payload_text_bytes, min(octet_length(payload::text)) AS min_payload_text_bytes, max(octet_length(payload::text)) AS max_payload_text_bytes FROM (SELECT payload FROM bench.orders TABLESAMPLE SYSTEM (1) LIMIT 1000) AS sample_rows;"
-```
-
-Helper script:
+Sample raw payload text sizes:
 
 ```powershell
 .\scripts.ps1 PayloadSize
@@ -120,16 +86,16 @@ This samples rows and shows:
 - `compressed_rows`: sampled rows where PostgreSQL reports toast compression
 - `toast_relation_total_size`: total size of the table's toast relation
 
-Check relation sizes:
-
-```powershell
-docker compose exec -T postgres psql -U postgres -d bench -c "SELECT pg_size_pretty(pg_table_size('bench.orders')) AS heap, pg_size_pretty(pg_indexes_size('bench.orders')) AS indexes, pg_size_pretty(pg_total_relation_size('bench.orders')) AS total;"
-```
-
-Helper script:
+Show heap, index, and total relation sizes:
 
 ```powershell
 .\scripts.ps1 RelationSize
+```
+
+Show the hot-row count used by the update workload:
+
+```powershell
+.\scripts.ps1 HotCount
 ```
 
 ## Running One Variant
@@ -140,85 +106,30 @@ The cleanest comparison is:
 2. start concurrent OLTP inserts and updates
 3. run one backfill variant
 4. capture the result from `bench.benchmark_runs`
-5. reseed from scratch
-6. run the other variant
+5. stop the workload
+6. reseed from scratch for the next variant
 
 Reseeding matters because physical row layout is part of what you are testing.
 
-### Step 1: Get The Hot Row Count
-
-```powershell
-$hotCount = docker compose exec -T postgres psql -U postgres -d bench -At -c "SELECT count(*) FROM bench.hot_seed_ids;"
-```
-
-Helper script:
-
-```powershell
-.\scripts.ps1 HotCount
-```
-
-### Step 2: Start Concurrent Updates And Inserts
-
-These jobs keep running while the backfill procedure runs.
-
-```powershell
-$updateJob = Start-Job -ArgumentList $hotCount -ScriptBlock {
-    param($HotCount)
-    docker compose exec -T postgres pgbench -U postgres -d bench -n -c 4 -j 4 -T 600 -D hot_count=$HotCount -f /pgbench/oltp_updates.sql
-}
-
-$insertJob = Start-Job -ScriptBlock {
-    docker compose exec -T postgres pgbench -U postgres -d bench -n -c 2 -j 2 -T 600 -f /pgbench/oltp_inserts.sql
-}
-```
-
-Tune `-c`, `-j`, and `-T` until the background workload looks like your environment.
-
-Helper script:
+Start the detached workload:
 
 ```powershell
 .\scripts.ps1 StartWorkload -UpdateClients 4 -UpdateThreads 4 -InsertClients 2 -InsertThreads 2 -WorkloadSeconds 600
 ```
 
-This helper starts detached `docker compose exec ... pgbench` processes, writes their output under `.runtime\logs`, and records their PIDs in `.runtime\workload-state.json` so you can stop them later with:
+Tune `-UpdateClients`, `-UpdateThreads`, `-InsertClients`, `-InsertThreads`, and `-WorkloadSeconds` until the background workload looks like your environment.
 
-```powershell
-.\scripts.ps1 StopWorkload
-```
+This helper starts detached `docker compose exec ... pgbench` processes, writes their output under `.runtime\logs`, and records their PIDs in `.runtime\workload-state.json`.
 
-### Step 3: Run The Backfill
-
-GUID PK ordered:
-
-```powershell
-docker compose exec -T postgres psql -U postgres -d bench -v ON_ERROR_STOP=1 -c "CALL bench.backfill_guid_pk_order(1000, 100);"
-```
-
-Helper script:
+Run one of the backfill variants:
 
 ```powershell
 .\scripts.ps1 BackfillGuid -BatchSize 1000 -LogEvery 100
 ```
 
-CTID ordered:
-
-```powershell
-docker compose exec -T postgres psql -U postgres -d bench -v ON_ERROR_STOP=1 -c "CALL bench.backfill_ctid_order(1000, 100);"
-```
-
-Helper script:
-
 ```powershell
 .\scripts.ps1 BackfillCtid -BatchSize 1000 -LogEvery 100
 ```
-
-Chunked CTID ordered:
-
-```powershell
-docker compose exec -T postgres psql -U postgres -d bench -v ON_ERROR_STOP=1 -c "CALL bench.backfill_ctid_chunked_order(1000, 100000, 100);"
-```
-
-Helper script:
 
 ```powershell
 .\scripts.ps1 BackfillCtidChunked -BatchSize 1000 -QueueChunkRows 100000 -LogEvery 100
@@ -226,7 +137,7 @@ Helper script:
 
 The procedure:
 
-- snapshots the current backfill candidates into a temp queue
+- snapshots or builds the current backfill candidates into a temp queue
 - processes that queue in batches of `p_batch_size`
 - commits after each batch
 - records the final metrics in `bench.benchmark_runs`
@@ -235,69 +146,63 @@ For `ctid_chunked`, the queue is built in repeated CTID-ordered chunks of `queue
 
 If concurrent OLTP updates populate `extracted_at` before the backfill reaches a row, that row is still removed from the queue but is not rewritten again.
 
-### Step 4: Read The Result
-
-```powershell
-docker compose exec -T postgres psql -U postgres -d bench -c "SELECT variant, batch_size, queue_chunk_rows, queue_rows, rows_processed, rows_updated, queue_build_ms, elapsed_ms, rows_processed_per_sec, rows_updated_per_sec, started_at, finished_at FROM bench.benchmark_runs ORDER BY started_at DESC LIMIT 5;"
-```
-
-Helper script:
+Read the result:
 
 ```powershell
 .\scripts.ps1 Results -ResultLimit 5
 ```
 
-### Step 5: Wait For The Workload Jobs
+Stop the detached workload:
 
 ```powershell
-Receive-Job $updateJob -Wait
-Receive-Job $insertJob -Wait
-Remove-Job $updateJob, $insertJob
+.\scripts.ps1 StopWorkload
 ```
 
-## Compare Both Variants Fairly
+## Compare Variants
 
-Recommended pattern:
-
-```powershell
-docker compose exec -T postgres psql -U postgres -d bench -v ON_ERROR_STOP=1 -c "CALL bench.seed_fixture(1000000, 2.5, 128, 2500);"
-# run GUID ordered variant
-
-docker compose exec -T postgres psql -U postgres -d bench -v ON_ERROR_STOP=1 -c "CALL bench.seed_fixture(1000000, 2.5, 128, 2500);"
-# run CTID ordered variant
-```
-
-That avoids comparing one run on a freshly loaded heap and the next run on a table that has already been fully rewritten once.
-
-Helper script:
+Compare GUID vs full CTID on fresh reseeds:
 
 ```powershell
 .\scripts.ps1 Compare -RowCount 1000000 -HotPct 2.5 -TemplateCount 128 -BlobTargetBytes 2500 -BatchSize 1000 -LogEvery 100 -WorkloadSeconds 600
 ```
 
-To compare only the two CTID strategies:
+That avoids comparing one run on a freshly loaded heap and the next run on a table that has already been fully rewritten once.
+
+Compare only the two CTID strategies:
 
 ```powershell
 .\scripts.ps1 CompareCtid -RowCount 1000000 -HotPct 2.5 -TemplateCount 128 -BlobTargetBytes 2500 -BatchSize 1000 -QueueChunkRows 100000 -LogEvery 100 -WorkloadSeconds 600
 ```
 
-## Procedures And Functions
+## Script Surface
 
-Main fixture procedures:
+Run this to see the available actions and parameters:
 
-- `CALL bench.seed_fixture(row_count, hot_pct, template_count, blob_target_bytes);`
-- `CALL bench.reset_fixture();`
+```powershell
+.\scripts.ps1 Help
+```
 
-Backfill procedures:
+Useful actions:
 
-- `CALL bench.backfill_guid_pk_order(batch_size, log_every);`
-- `CALL bench.backfill_ctid_order(batch_size, log_every);`
-- `CALL bench.backfill_ctid_chunked_order(batch_size, queue_chunk_rows, log_every);`
-
-Concurrent workload helpers used by `pgbench`:
-
-- `SELECT bench.touch_hot_seed_row(slot);`
-- `SELECT bench.insert_oltp_row(seed);`
+- `Up`
+- `Ps`
+- `Seed`
+- `Reset`
+- `Shape`
+- `PayloadSize`
+- `ToastCheck`
+- `RelationSize`
+- `HotCount`
+- `StartWorkload`
+- `StopWorkload`
+- `BackfillGuid`
+- `BackfillCtid`
+- `BackfillCtidChunked`
+- `Results`
+- `Compare`
+- `CompareCtid`
+- `Down`
+- `Destroy`
 
 ## Notes On The CTID Variants
 
@@ -367,34 +272,16 @@ Takeaways:
 Reset rows without reseeding:
 
 ```powershell
-docker compose exec -T postgres psql -U postgres -d bench -c "CALL bench.reset_fixture();"
-```
-
-Helper script:
-
-```powershell
 .\scripts.ps1 Reset
 ```
 
 Stop Postgres:
 
 ```powershell
-docker compose down
-```
-
-Helper script:
-
-```powershell
 .\scripts.ps1 Down
 ```
 
 Stop and delete the database volume:
-
-```powershell
-docker compose down -v
-```
-
-Helper script:
 
 ```powershell
 .\scripts.ps1 Destroy
