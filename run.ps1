@@ -6,8 +6,6 @@
 
 .\scripts.ps1 Destroy
 
-.\scripts.ps1 Seed
-
 .\scripts.ps1 Seed -RowCount 1000000 -HotPct 2.5 -TemplateCount 128 -BlobTargetBytes 2500
 
 .\scripts.ps1 RelationSize
@@ -21,4 +19,7 @@
 
 .\scripts.ps1 Results
 .\scripts.ps1 Compare
-asdfads
+
+.\scripts.ps1 CompareCtid
+
+.\scripts.ps1 BackfillCtidLive

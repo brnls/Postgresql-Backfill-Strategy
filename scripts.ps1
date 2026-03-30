@@ -18,9 +18,8 @@ param(
         'StopWorkload',
         'BackfillGuid',
         'BackfillCtid',
-        'BackfillCtidChunked',
+        'BackfillCtidLive',
         'Results',
-        'CompareCtid',
         'Compare'
     )]
     [string]$Action = 'Help',
@@ -31,7 +30,6 @@ param(
     [int]$BlobTargetBytes = 2500,
     [string]$HistorySpan = '365 days',
     [int]$BatchSize = 1000,
-    [int]$QueueChunkRows = 100000,
     [int]$LogEvery = 100,
     [int]$UpdateClients = 4,
     [int]$UpdateThreads = 4,
@@ -363,12 +361,12 @@ function Invoke-BackfillCtid {
     Invoke-Psql -Sql "CALL bench.backfill_ctid_order($BatchSize, $LogEvery);" | Write-Output
 }
 
-function Invoke-BackfillCtidChunked {
-    Invoke-Psql -Sql "CALL bench.backfill_ctid_chunked_order($BatchSize, $QueueChunkRows, $LogEvery);" | Write-Output
+function Invoke-BackfillCtidLive {
+    Invoke-Psql -Sql "CALL bench.backfill_ctid_live_cursor($BatchSize, $LogEvery);" | Write-Output
 }
 
 function Show-Results {
-    Invoke-Psql -Sql "SELECT variant, batch_size, queue_chunk_rows, queue_rows, rows_processed, rows_updated, queue_build_ms, elapsed_ms, rows_processed_per_sec, rows_updated_per_sec, started_at, finished_at FROM bench.benchmark_runs ORDER BY started_at DESC LIMIT $ResultLimit;" -NoStopOnError | Write-Output
+    Invoke-Psql -Sql "SELECT variant, batch_size, queue_rows, rows_processed, rows_updated, queue_build_ms, elapsed_ms, rows_processed_per_sec, rows_updated_per_sec, started_at, finished_at FROM bench.benchmark_runs WHERE variant IN ('guid', 'ctid', 'ctid_live') ORDER BY started_at DESC LIMIT $ResultLimit;" -NoStopOnError | Write-Output
 }
 
 function Invoke-Compare {
@@ -397,32 +395,6 @@ function Invoke-Compare {
     Show-Results
 }
 
-function Invoke-CompareCtid {
-    Write-Host 'Seeding fixture for full CTID-ordered backfill...'
-    Seed-Fixture
-    Start-Workload
-    try {
-        Write-Host 'Running full CTID-ordered backfill...'
-        Invoke-BackfillCtid
-    }
-    finally {
-        Stop-Workload
-    }
-
-    Write-Host 'Seeding fixture for chunked CTID-ordered backfill...'
-    Seed-Fixture
-    Start-Workload
-    try {
-        Write-Host 'Running chunked CTID-ordered backfill...'
-        Invoke-BackfillCtidChunked
-    }
-    finally {
-        Stop-Workload
-    }
-
-    Show-Results
-}
-
 function Show-HelpText {
     @'
 Usage:
@@ -431,9 +403,8 @@ Usage:
   .\scripts.ps1 StartWorkload -WorkloadSeconds 900
   .\scripts.ps1 BackfillGuid -BatchSize 1000 -LogEvery 100
   .\scripts.ps1 BackfillCtid -BatchSize 1000 -LogEvery 100
-  .\scripts.ps1 BackfillCtidChunked -BatchSize 1000 -QueueChunkRows 100000 -LogEvery 100
+  .\scripts.ps1 BackfillCtidLive -BatchSize 1000 -LogEvery 100
   .\scripts.ps1 Results -ResultLimit 10
-  .\scripts.ps1 CompareCtid -RowCount 1000000 -BatchSize 1000 -QueueChunkRows 100000 -WorkloadSeconds 600
   .\scripts.ps1 Compare -RowCount 1000000 -BatchSize 1000 -WorkloadSeconds 600
   .\scripts.ps1 StopWorkload
   .\scripts.ps1 Destroy
@@ -454,9 +425,8 @@ Actions:
   StopWorkload  Stop detached workload processes started by this script.
   BackfillGuid  Run the GUID PK ordered backfill procedure.
   BackfillCtid  Run the CTID ordered backfill procedure.
-  BackfillCtidChunked Run the chunked CTID ordered backfill procedure.
+  BackfillCtidLive Run the live CTID cursor backfill procedure.
   Results       Show recent rows from bench.benchmark_runs.
-  CompareCtid   Reseed and run CTID, then reseed and run CTID chunked.
   Compare       Reseed and run GUID, then reseed and run CTID, each with workload.
 
 Common parameters:
@@ -466,7 +436,6 @@ Common parameters:
   -BlobTargetBytes
   -HistorySpan
   -BatchSize
-  -QueueChunkRows
   -LogEvery
   -UpdateClients
   -UpdateThreads
@@ -494,9 +463,8 @@ switch ($Action) {
     'StopWorkload' { Stop-Workload }
     'BackfillGuid' { Invoke-BackfillGuid }
     'BackfillCtid' { Invoke-BackfillCtid }
-    'BackfillCtidChunked' { Invoke-BackfillCtidChunked }
+    'BackfillCtidLive' { Invoke-BackfillCtidLive }
     'Results' { Show-Results }
-    'CompareCtid' { Invoke-CompareCtid }
     'Compare' { Invoke-Compare }
     default { throw "Unsupported action: $Action" }
 }

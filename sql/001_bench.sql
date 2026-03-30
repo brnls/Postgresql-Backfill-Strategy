@@ -63,13 +63,6 @@ BEGIN
         ALTER TABLE bench.benchmark_runs
             DROP CONSTRAINT benchmark_runs_variant_check;
     END IF;
-
-    ALTER TABLE bench.benchmark_runs
-        ADD CONSTRAINT benchmark_runs_variant_check
-        CHECK (variant IN ('guid', 'ctid', 'ctid_chunked'));
-EXCEPTION
-    WHEN duplicate_object THEN
-        NULL;
 END;
 $$;
 
@@ -493,9 +486,10 @@ BEGIN
 END;
 $$;
 
-CREATE OR REPLACE PROCEDURE bench.backfill_ctid_chunked_order(
+DROP PROCEDURE IF EXISTS bench.backfill_ctid_chunked_order(integer, integer, integer);
+
+CREATE OR REPLACE PROCEDURE bench.backfill_ctid_live_cursor(
     p_batch_size integer DEFAULT 1000,
-    p_queue_chunk_rows integer DEFAULT 100000,
     p_log_every integer DEFAULT 100
 )
 LANGUAGE plpgsql
@@ -503,17 +497,16 @@ AS $$
 DECLARE
     v_run_id uuid := gen_random_uuid();
     v_started_at timestamptz := clock_timestamp();
-    v_chunk_started_at timestamptz;
+    v_select_started_at timestamptz;
     v_finished_at timestamptz;
-    v_last_heap_tid tid;
-    v_chunk_rows integer := 0;
+    v_last_heap_tid tid := '(0,0)'::tid;
+    v_next_heap_tid tid;
+    v_batch_ids uuid[];
     v_rows_picked integer := 0;
     v_rows_updated integer := 0;
-    v_total_queue_rows bigint := 0;
     v_total_processed bigint := 0;
     v_total_updated bigint := 0;
     v_batches integer := 0;
-    v_chunk_builds integer := 0;
     v_queue_build_ms numeric(18,3) := 0;
     v_elapsed_ms numeric(18,3);
 BEGIN
@@ -521,113 +514,55 @@ BEGIN
         RAISE EXCEPTION 'p_batch_size must be at least 1';
     END IF;
 
-    IF p_queue_chunk_rows < 1 THEN
-        RAISE EXCEPTION 'p_queue_chunk_rows must be at least 1';
-    END IF;
-
-    DROP TABLE IF EXISTS pg_temp.backfill_queue;
-
-    CREATE TEMP TABLE backfill_queue (
-        queue_row_id bigserial PRIMARY KEY,
-        id uuid NOT NULL,
-        heap_tid tid NOT NULL
-    ) ON COMMIT PRESERVE ROWS;
-
-    CREATE INDEX backfill_queue_order_idx
-        ON backfill_queue (heap_tid, queue_row_id);
-
     LOOP
-        v_chunk_started_at := clock_timestamp();
+        v_select_started_at := clock_timestamp();
 
-        IF v_last_heap_tid IS NULL THEN
-            WITH queued AS (
-                INSERT INTO backfill_queue (id, heap_tid)
-                SELECT
-                    id,
-                    ctid
-                FROM bench.orders
-                WHERE extracted_at IS NULL
-                ORDER BY ctid
-                LIMIT p_queue_chunk_rows
-                RETURNING heap_tid
-            )
-            SELECT COUNT(*), MAX(heap_tid)
-            INTO v_chunk_rows, v_last_heap_tid
-            FROM queued;
-        ELSE
-            WITH queued AS (
-                INSERT INTO backfill_queue (id, heap_tid)
-                SELECT
-                    id,
-                    ctid
-                FROM bench.orders
-                WHERE extracted_at IS NULL
-                  AND ctid > v_last_heap_tid
-                ORDER BY ctid
-                LIMIT p_queue_chunk_rows
-                RETURNING heap_tid
-            )
-            SELECT COUNT(*), MAX(heap_tid)
-            INTO v_chunk_rows, v_last_heap_tid
-            FROM queued;
+        SELECT
+            COALESCE(array_agg(id ORDER BY heap_tid), ARRAY[]::uuid[]),
+            MAX(heap_tid),
+            COUNT(*)
+        INTO
+            v_batch_ids,
+            v_next_heap_tid,
+            v_rows_picked
+        FROM (
+            SELECT
+                id,
+                ctid AS heap_tid
+            FROM bench.orders
+            WHERE extracted_at IS NULL
+              AND ctid > v_last_heap_tid
+            ORDER BY ctid
+            LIMIT p_batch_size
+        ) AS next_batch;
+
+        v_queue_build_ms := v_queue_build_ms + (EXTRACT(epoch FROM clock_timestamp() - v_select_started_at) * 1000.0);
+
+        EXIT WHEN v_rows_picked = 0;
+
+        v_last_heap_tid := v_next_heap_tid;
+
+        UPDATE bench.orders AS o
+        SET extracted_at = bench.extract_payload_ts(o.payload)
+        WHERE o.id = ANY(v_batch_ids)
+          AND o.extracted_at IS NULL;
+
+        GET DIAGNOSTICS v_rows_updated = ROW_COUNT;
+
+        v_batches := v_batches + 1;
+        v_total_processed := v_total_processed + v_rows_picked;
+        v_total_updated := v_total_updated + v_rows_updated;
+
+        IF p_log_every > 0 AND MOD(v_batches, p_log_every) = 0 THEN
+            RAISE NOTICE '[ctid_live] batch %, processed %, updated %, selection_ms %, elapsed_ms %',
+                v_batches,
+                v_total_processed,
+                v_total_updated,
+                ROUND(v_queue_build_ms, 3),
+                ROUND(EXTRACT(epoch FROM clock_timestamp() - v_started_at) * 1000.0, 3);
         END IF;
 
-        EXIT WHEN v_chunk_rows = 0;
-
-        v_chunk_builds := v_chunk_builds + 1;
-        v_total_queue_rows := v_total_queue_rows + v_chunk_rows;
-        v_queue_build_ms := v_queue_build_ms + (EXTRACT(epoch FROM clock_timestamp() - v_chunk_started_at) * 1000.0);
-
-        ANALYZE backfill_queue;
-
-        RAISE NOTICE '[ctid_chunked] chunk %, queued % rows up to %, cumulative_queue_build_ms %',
-            v_chunk_builds,
-            v_chunk_rows,
-            v_last_heap_tid,
-            ROUND(v_queue_build_ms, 3);
-
         COMMIT;
-
-        LOOP
-            WITH next_batch AS (
-                DELETE FROM backfill_queue AS q
-                WHERE q.queue_row_id IN (
-                    SELECT queue_row_id
-                    FROM backfill_queue
-                    ORDER BY heap_tid, queue_row_id
-                    LIMIT p_batch_size
-                )
-                RETURNING q.id
-            ),
-            updated AS (
-                UPDATE bench.orders AS o
-                SET extracted_at = bench.extract_payload_ts(o.payload)
-                FROM next_batch AS b
-                WHERE o.id = b.id
-                  AND o.extracted_at IS NULL
-                RETURNING o.id
-            )
-            SELECT
-                (SELECT COUNT(*) FROM next_batch),
-                (SELECT COUNT(*) FROM updated)
-            INTO v_rows_picked, v_rows_updated;
-
-            EXIT WHEN v_rows_picked = 0;
-
-            v_batches := v_batches + 1;
-            v_total_processed := v_total_processed + v_rows_picked;
-            v_total_updated := v_total_updated + v_rows_updated;
-
-            IF p_log_every > 0 AND MOD(v_batches, p_log_every) = 0 THEN
-                RAISE NOTICE '[ctid_chunked] batch %, processed %, updated %, elapsed_ms %',
-                    v_batches,
-                    v_total_processed,
-                    v_total_updated,
-                    ROUND(EXTRACT(epoch FROM clock_timestamp() - v_started_at) * 1000.0, 3);
-            END IF;
-
-            COMMIT;
-        END LOOP;
     END LOOP;
 
     v_finished_at := clock_timestamp();
@@ -650,10 +585,10 @@ BEGIN
     )
     VALUES (
         v_run_id,
-        'ctid_chunked',
+        'ctid_live',
         p_batch_size,
-        p_queue_chunk_rows,
-        v_total_queue_rows,
+        NULL,
+        v_total_processed,
         v_total_processed,
         v_total_updated,
         v_queue_build_ms,
@@ -670,14 +605,14 @@ BEGIN
         v_finished_at
     );
 
-    RAISE NOTICE '[ctid_chunked] finished: chunks %, queued %, processed %, updated %, elapsed_ms %',
-        v_chunk_builds,
-        v_total_queue_rows,
+    RAISE NOTICE '[ctid_live] finished: processed %, updated %, selection_ms %, elapsed_ms %',
         v_total_processed,
         v_total_updated,
+        ROUND(v_queue_build_ms, 3),
         ROUND(v_elapsed_ms, 3);
 END;
 $$;
+
 
 CREATE OR REPLACE PROCEDURE bench.backfill_guid_pk_order(
     p_batch_size integer DEFAULT 1000,
